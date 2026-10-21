@@ -1,0 +1,51 @@
+<!doctype html><meta charset="utf-8"><style>html,body,#m{margin:0;width:768px;height:768px}</style><div id="m"></div><pre id="out"></pre>
+<script type="module">
+// ?lib=<url of maplibre-gl.mjs> to try another build (its worker beside it); stock 6.13.0 by default
+// ?until=refresh stops after step 1 (for a screenshot: shots.mjs)
+const q = new URLSearchParams(location.search), lib = q.get("lib");
+const maplibregl = await import(lib || "https://unpkg.com/maplibre-gl@6.13.0/dist/maplibre-gl.mjs");
+if (lib) maplibregl.setWorkerUrl(new URL("maplibre-gl-worker.mjs", new URL(lib, location.href)).href);
+// a raster-dem source whose heights shift by 40 m per version of a tile
+const version = {};
+maplibregl.addProtocol("fake", async ({ url }) => {
+  const [z, x, y] = url.slice(7).split("/").map(Number), v = version[`${z}/${x}/${y}`] || 0, n = 256;
+  const c = new OffscreenCanvas(n, n), g = c.getContext("2d"), img = g.createImageData(n, n);
+  for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+    const h = 500 + 120 * Math.sin((x * n + i) / 37) + 90 * Math.cos((y * n + j) / 53) + 40 * v + 32768, q = 4 * (j * n + i);
+    img.data.set([h >> 8, Math.floor(h) & 255, Math.floor((h % 1) * 256), 255], q);
+  }
+  g.putImageData(img, 0, 0);
+  return { data: await (await c.convertToBlob({ type: "image/png" })).arrayBuffer() };
+});
+const map = new maplibregl.Map({ container: "m", center: [17.33, 66.54], zoom: 10.5, style: { version: 8,
+  sources: { dem: { type: "raster-dem", tiles: ["fake://{z}/{x}/{y}"], tileSize: 256, encoding: "terrarium", maxzoom: 12 } },
+  layers: [{ id: "shade", type: "hillshade", source: "dem" }] } });
+// borders of the tiles in view that don't hold their neighbour's edge
+const stale = () => {
+  const tiles = map.style.tileManagers.dem._inViewTiles.getAllTiles().filter(t => t.dem), at = new Map(tiles.map(t => [`${t.tileID.canonical.x}/${t.tileID.canonical.y}`, t]));
+  let bad = 0, all = 0;
+  for (const t of tiles) for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    const nb = at.get(`${t.tileID.canonical.x + dx}/${t.tileID.canonical.y + dy}`), n = t.dem.dim; if (!nb) continue; all++;
+    for (let k = 0; k < n; k++) { const [i, j] = dx ? [dx > 0 ? n : -1, k] : [k, dy > 0 ? n : -1];
+      if (t.dem.get(i, j) !== nb.dem.get(i - dx * n, j - dy * n)) { bad++; break; } }
+  }
+  return `${bad} of ${all} borders stale`;
+};
+const settled = () => new Promise(r => map.once("idle", () => setTimeout(r, 200)));
+const log = s => { out.textContent += s + "\n"; console.log(s); };
+await settled(); log("loaded: " + stale());
+// 1. new heights for every tile, reloaded in place
+const ids = map.style.tileManagers.dem._inViewTiles.getAllTiles().map(t => t.tileID.canonical);
+for (const c of ids) version[`${c.z}/${c.x}/${c.y}`] = 1;
+map.refreshTiles("dem", ids.map(c => ({ z: c.z, x: c.x, y: c.y })));
+await settled(); log("after refreshTiles: " + stale());
+if (q.get("until") === "refresh") { document.title = "done"; throw 0; }
+// 2. a column goes out of view (cached), its neighbours get new heights, it comes back
+map.panBy([256, 0], { duration: 0 }); await settled();
+const inView = map.style.tileManagers.dem._inViewTiles.getAllTiles().map(t => t.tileID.canonical);
+for (const c of inView) version[`${c.z}/${c.x}/${c.y}`] = 2;
+map.refreshTiles("dem", inView.map(c => ({ z: c.z, x: c.x, y: c.y })));
+await settled(); map.panBy([-256, 0], { duration: 0 }); await settled();
+log("a tile back from the cache: " + stale());
+document.title = "done";
+</script>
